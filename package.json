@@ -1,10 +1,15 @@
 {
-"name": "ai-site",
-"version": "1.0.0",
-"description": "AI site with backend",
-"main": "api-server/index.js",
-"scripts": {
-"start": "node api-server/index.js"
-},
-"dependencies": {}
+  "name": "ai-site",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "npx vite build",
+    "start": "npx serve -s dist"
+  },
+  "dependencies": {
+    "serve": "^14.2.0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0",
+    "typescript": "^5.0.0"
+  }
 }
