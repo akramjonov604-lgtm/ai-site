@@ -1,0 +1,663 @@
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+
+const DATA_DIR = path.resolve(process.cwd(), ".data");
+const DATA_FILE = path.join(DATA_DIR, "admin.json");
+
+export interface ApiKeyEntry {
+  id: string;
+  label: string;
+  key: string;
+  createdAt: number;
+  lastUsedAt: number | null;
+  active: boolean;
+  status: "ok" | "quota" | "invalid";
+  failedAt: number | null;
+  totalRequests: number;
+  totalErrors: number;
+}
+
+// Per-key daily counters keyed by Pacific-Time date (Gemini quotas reset at PT midnight).
+// Shape: { "YYYY-MM-DD": { keyId: { requests, errors } } }
+type KeyDailyUsage = Record<
+  string,
+  Record<string, { requests: number; errors: number }>
+>;
+
+export interface UserStat {
+  uid: string;
+  email: string;
+  displayName: string;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  totalMessages: number;
+  totalTokensApprox: number;
+  lastIp: string | null;
+}
+
+export interface DailyStat {
+  date: string;
+  messages: number;
+  users: Set<string>;
+  errors: number;
+  tokens: number;
+}
+
+interface RawDailyStat {
+  date: string;
+  messages: number;
+  users: string[];
+  errors: number;
+  tokens: number;
+}
+
+interface PersistedData {
+  adminEmail: string;
+  adminPasswordHash: string;
+  adminPasswordSalt: string;
+  sessionTokens: Record<string, number>;
+  apiKeys: ApiKeyEntry[];
+  activeKeyId: string | null;
+  users: Record<string, UserStat>;
+  daily: RawDailyStat[];
+  keyDailyUsage: KeyDailyUsage;
+  totals: {
+    messages: number;
+    errors: number;
+    tokens: number;
+    keyRotations: number;
+    cacheClears: number;
+  };
+  cacheLastClearedAt: number;
+  startedAt: number;
+}
+
+const DEFAULT_ADMIN_EMAIL = "Akramjonov604@gmail.com";
+const DEFAULT_ADMIN_PASSWORD = "Akramov_701";
+
+function hashPassword(password: string, salt: string): string {
+  return crypto.scryptSync(password, salt, 64).toString("hex");
+}
+
+function emptyData(): PersistedData {
+  const salt = crypto.randomBytes(16).toString("hex");
+  return {
+    adminEmail: DEFAULT_ADMIN_EMAIL,
+    adminPasswordHash: hashPassword(DEFAULT_ADMIN_PASSWORD, salt),
+    adminPasswordSalt: salt,
+    sessionTokens: {},
+    apiKeys: [],
+    activeKeyId: null,
+    users: {},
+    daily: [],
+    keyDailyUsage: {},
+    totals: {
+      messages: 0,
+      errors: 0,
+      tokens: 0,
+      keyRotations: 0,
+      cacheClears: 0,
+    },
+    cacheLastClearedAt: Date.now(),
+    startedAt: Date.now(),
+  };
+}
+
+let data: PersistedData;
+let saveTimer: NodeJS.Timeout | null = null;
+
+function load(): PersistedData {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, "utf8");
+      const parsed = JSON.parse(raw) as PersistedData;
+      // Ensure all fields exist (forward-compat)
+      const def = emptyData();
+      return {
+        ...def,
+        ...parsed,
+        sessionTokens: parsed.sessionTokens ?? {},
+        users: parsed.users ?? {},
+        daily: parsed.daily ?? [],
+        keyDailyUsage: parsed.keyDailyUsage ?? {},
+        totals: { ...def.totals, ...(parsed.totals ?? {}) },
+        apiKeys: parsed.apiKeys ?? [],
+      };
+    }
+  } catch {
+    // fall through
+  }
+  const fresh = emptyData();
+  persist(fresh);
+  return fresh;
+}
+
+function persist(d: PersistedData = data) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2));
+  } catch {
+    // ignore
+  }
+}
+
+function schedulePersist() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    persist();
+  }, 500);
+}
+
+data = load();
+
+// Seed initial key from env if available and store empty
+if (data.apiKeys.length === 0 && process.env.GEMINI_API_KEY) {
+  const id = crypto.randomBytes(8).toString("hex");
+  data.apiKeys.push({
+    id,
+    label: "ENV (default)",
+    key: process.env.GEMINI_API_KEY,
+    createdAt: Date.now(),
+    lastUsedAt: null,
+    active: true,
+    status: "ok",
+    failedAt: null,
+    totalRequests: 0,
+    totalErrors: 0,
+  });
+  data.activeKeyId = id;
+  persist();
+}
+
+// ===== Auth =====
+
+export function verifyAdminLogin(email: string, password: string): string | null {
+  if (email.trim().toLowerCase() !== data.adminEmail.toLowerCase()) return null;
+  const expected = data.adminPasswordHash;
+  const got = hashPassword(password, data.adminPasswordSalt);
+  if (expected.length !== got.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(got, "hex"))) {
+    return null;
+  }
+  const token = crypto.randomBytes(32).toString("hex");
+  data.sessionTokens[token] = Date.now() + 1000 * 60 * 60 * 24 * 7; // 7 days
+  schedulePersist();
+  return token;
+}
+
+export function verifySession(token: string | undefined | null): boolean {
+  if (!token) return false;
+  const exp = data.sessionTokens[token];
+  if (!exp) return false;
+  if (exp < Date.now()) {
+    delete data.sessionTokens[token];
+    schedulePersist();
+    return false;
+  }
+  return true;
+}
+
+export function logoutSession(token: string | undefined | null) {
+  if (!token) return;
+  delete data.sessionTokens[token];
+  schedulePersist();
+}
+
+export function getAdminEmail(): string {
+  return data.adminEmail;
+}
+
+// ===== API keys =====
+
+export function listKeys(): ApiKeyEntry[] {
+  return data.apiKeys.map((k) => ({ ...k }));
+}
+
+export function listKeysSafe(): Array<
+  Omit<ApiKeyEntry, "key"> & {
+    keyMasked: string;
+    requestsToday: number;
+    errorsToday: number;
+    quotaResetAt: number;
+  }
+> {
+  const ptDate = ptDateKey();
+  const todayBucket = data.keyDailyUsage[ptDate] ?? {};
+  const resetAt = nextPTMidnightMs();
+  return data.apiKeys.map(({ key, ...rest }) => {
+    const stats = todayBucket[rest.id] ?? { requests: 0, errors: 0 };
+    return {
+      ...rest,
+      keyMasked: maskKey(key),
+      requestsToday: stats.requests,
+      errorsToday: stats.errors,
+      quotaResetAt: resetAt,
+    };
+  });
+}
+
+// ===== Quota helpers (Pacific Time daily reset) =====
+
+function ptDateKey(d = new Date()): string {
+  // YYYY-MM-DD in America/Los_Angeles (matches Gemini quota window)
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return fmt.format(d);
+}
+
+function nextPTMidnightMs(now: number = Date.now()): number {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date(now));
+  const pick = (t: string) =>
+    Number(parts.find((p) => p.type === t)?.value ?? "0");
+  const h = pick("hour") % 24;
+  const m = pick("minute");
+  const s = pick("second");
+  const elapsedMs = ((h * 60 + m) * 60 + s) * 1000;
+  const dayMs = 24 * 60 * 60 * 1000;
+  return now + (dayMs - elapsedMs);
+}
+
+function pruneKeyDailyUsage() {
+  // Keep only the last 7 PT-date buckets to bound disk growth.
+  const dates = Object.keys(data.keyDailyUsage).sort();
+  const keep = 7;
+  if (dates.length > keep) {
+    for (const d of dates.slice(0, dates.length - keep)) {
+      delete data.keyDailyUsage[d];
+    }
+  }
+}
+
+function maskKey(key: string): string {
+  if (key.length < 10) return "••••••";
+  return `${key.slice(0, 4)}••••${key.slice(-4)}`;
+}
+
+export function addKey(label: string, key: string): ApiKeyEntry {
+  const id = crypto.randomBytes(8).toString("hex");
+  const entry: ApiKeyEntry = {
+    id,
+    label: label.trim() || `Key ${data.apiKeys.length + 1}`,
+    key: key.trim(),
+    createdAt: Date.now(),
+    lastUsedAt: null,
+    active: true,
+    status: "ok",
+    failedAt: null,
+    totalRequests: 0,
+    totalErrors: 0,
+  };
+  data.apiKeys.push(entry);
+
+  // Promote the new key if there's no active one OR the current active one
+  // is dead (quota/invalid/disabled). This way, adding a key during an outage
+  // immediately recovers chat for all users — no manual switchover needed.
+  const currentActive = data.activeKeyId
+    ? data.apiKeys.find((k) => k.id === data.activeKeyId)
+    : null;
+  const currentActiveDead =
+    !currentActive ||
+    !currentActive.active ||
+    currentActive.status === "invalid" ||
+    currentActive.status === "quota";
+  if (!data.activeKeyId || currentActiveDead) {
+    data.activeKeyId = id;
+  }
+  schedulePersist();
+  return entry;
+}
+
+export function deleteKey(id: string): boolean {
+  const idx = data.apiKeys.findIndex((k) => k.id === id);
+  if (idx === -1) return false;
+  data.apiKeys.splice(idx, 1);
+  if (data.activeKeyId === id) {
+    const next = data.apiKeys.find((k) => k.active && k.status !== "invalid");
+    data.activeKeyId = next?.id ?? null;
+  }
+  schedulePersist();
+  return true;
+}
+
+export function setActiveKey(id: string): boolean {
+  const found = data.apiKeys.find((k) => k.id === id);
+  if (!found) return false;
+  data.activeKeyId = id;
+  found.active = true;
+  found.status = "ok";
+  found.failedAt = null;
+  schedulePersist();
+  return true;
+}
+
+export function toggleKey(id: string, active: boolean): boolean {
+  const found = data.apiKeys.find((k) => k.id === id);
+  if (!found) return false;
+  found.active = active;
+  if (data.activeKeyId === id && !active) {
+    const next = data.apiKeys.find((k) => k.id !== id && k.active && k.status !== "invalid");
+    data.activeKeyId = next?.id ?? null;
+  }
+  schedulePersist();
+  return true;
+}
+
+export function getActiveKey(): ApiKeyEntry | null {
+  // Prefer healthy (status="ok") active keys. Quota-exhausted keys are only
+  // tried as a last resort in case the quota window has reset.
+  const healthy = data.apiKeys.find((k) => k.active && k.status === "ok");
+  if (healthy) {
+    if (data.activeKeyId !== healthy.id) {
+      data.activeKeyId = healthy.id;
+      schedulePersist();
+    }
+    return healthy;
+  }
+  if (data.activeKeyId) {
+    const found = data.apiKeys.find((k) => k.id === data.activeKeyId);
+    if (found && found.active && found.status !== "invalid") return found;
+  }
+  const fallback = data.apiKeys.find((k) => k.active && k.status !== "invalid");
+  if (fallback) {
+    data.activeKeyId = fallback.id;
+    schedulePersist();
+    return fallback;
+  }
+  if (data.activeKeyId !== null) {
+    data.activeKeyId = null;
+    schedulePersist();
+  }
+  return null;
+}
+
+export function rotateAfterFailure(failedKeyId: string, reason: "quota" | "invalid"): ApiKeyEntry | null {
+  const failed = data.apiKeys.find((k) => k.id === failedKeyId);
+  if (failed) {
+    failed.status = reason;
+    failed.failedAt = Date.now();
+    failed.totalErrors += 1;
+  }
+  data.totals.keyRotations += 1;
+  // Prefer a healthy ("ok") replacement; fall back to any non-invalid active key.
+  const next =
+    data.apiKeys.find(
+      (k) => k.id !== failedKeyId && k.active && k.status === "ok",
+    ) ??
+    data.apiKeys.find(
+      (k) => k.id !== failedKeyId && k.active && k.status !== "invalid",
+    );
+  if (next) {
+    data.activeKeyId = next.id;
+    schedulePersist();
+    return next;
+  }
+  // No replacement — clear activeKeyId so the next addKey() cleanly takes over.
+  data.activeKeyId = null;
+  schedulePersist();
+  return null;
+}
+
+export function recordKeyUsage(keyId: string, error: boolean) {
+  const k = data.apiKeys.find((x) => x.id === keyId);
+  if (!k) return;
+  k.lastUsedAt = Date.now();
+  k.totalRequests += 1;
+  if (error) k.totalErrors += 1;
+  // Per-day (Pacific Time) counter for live "today" view
+  const ptDate = ptDateKey();
+  if (!data.keyDailyUsage[ptDate]) {
+    data.keyDailyUsage[ptDate] = {};
+    pruneKeyDailyUsage();
+  }
+  const bucket = data.keyDailyUsage[ptDate];
+  if (!bucket[keyId]) bucket[keyId] = { requests: 0, errors: 0 };
+  bucket[keyId].requests += 1;
+  if (error) bucket[keyId].errors += 1;
+  schedulePersist();
+}
+
+// ===== User stats =====
+
+function todayKey(d = new Date()): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function getOrCreateDaily(date: string): DailyStat {
+  let raw = data.daily.find((x) => x.date === date);
+  if (!raw) {
+    raw = { date, messages: 0, users: [], errors: 0, tokens: 0 };
+    data.daily.push(raw);
+  }
+  return {
+    date: raw.date,
+    messages: raw.messages,
+    users: new Set(raw.users),
+    errors: raw.errors,
+    tokens: raw.tokens,
+  };
+}
+
+function saveDaily(stat: DailyStat) {
+  const idx = data.daily.findIndex((x) => x.date === stat.date);
+  const raw: RawDailyStat = {
+    date: stat.date,
+    messages: stat.messages,
+    users: Array.from(stat.users),
+    errors: stat.errors,
+    tokens: stat.tokens,
+  };
+  if (idx === -1) data.daily.push(raw);
+  else data.daily[idx] = raw;
+  // keep only last 60 days
+  data.daily.sort((a, b) => a.date.localeCompare(b.date));
+  if (data.daily.length > 60) data.daily = data.daily.slice(-60);
+}
+
+export function registerUser(opts: {
+  uid: string;
+  email?: string | null;
+  displayName?: string | null;
+  ip?: string | null;
+  source?: "firebase" | "local" | string | null;
+}): UserStat | null {
+  const uid = (opts.uid ?? "").trim();
+  if (!uid) return null;
+  const email = (opts.email ?? "").trim() || "Mehmon";
+  const displayName = (opts.displayName ?? "").trim() || email;
+  const now = Date.now();
+
+  const existing = data.users[uid];
+  if (existing) {
+    existing.lastSeenAt = now;
+    if (email && email !== "Mehmon") existing.email = email;
+    if (displayName) existing.displayName = displayName;
+    if (opts.ip) existing.lastIp = opts.ip;
+  } else {
+    data.users[uid] = {
+      uid,
+      email,
+      displayName,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      totalMessages: 0,
+      totalTokensApprox: 0,
+      lastIp: opts.ip ?? null,
+    };
+  }
+
+  schedulePersist();
+  return data.users[uid] ?? null;
+}
+
+export function recordMessage(opts: {
+  uid?: string | null;
+  email?: string | null;
+  displayName?: string | null;
+  ip?: string | null;
+  tokensApprox?: number;
+  error?: boolean;
+}) {
+  const uid = (opts.uid ?? "").trim() || `anon:${opts.ip ?? "unknown"}`;
+  const email = (opts.email ?? "").trim() || "Mehmon";
+  const displayName = (opts.displayName ?? "").trim() || email;
+  const now = Date.now();
+  const tokens = Math.max(0, Math.floor(opts.tokensApprox ?? 0));
+
+  const existing = data.users[uid];
+  if (existing) {
+    existing.lastSeenAt = now;
+    existing.totalMessages += 1;
+    existing.totalTokensApprox += tokens;
+    if (email && email !== "Mehmon") existing.email = email;
+    if (displayName) existing.displayName = displayName;
+    if (opts.ip) existing.lastIp = opts.ip;
+  } else {
+    data.users[uid] = {
+      uid,
+      email,
+      displayName,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      totalMessages: 1,
+      totalTokensApprox: tokens,
+      lastIp: opts.ip ?? null,
+    };
+  }
+
+  data.totals.messages += 1;
+  data.totals.tokens += tokens;
+  if (opts.error) data.totals.errors += 1;
+
+  const today = getOrCreateDaily(todayKey());
+  today.messages += 1;
+  today.tokens += tokens;
+  if (opts.error) today.errors += 1;
+  today.users.add(uid);
+  saveDaily(today);
+
+  schedulePersist();
+}
+
+export interface OverviewStats {
+  totals: {
+    messages: number;
+    errors: number;
+    tokens: number;
+    users: number;
+    keyRotations: number;
+    cacheClears: number;
+  };
+  today: { messages: number; users: number; errors: number };
+  daily: Array<{ date: string; messages: number; users: number; errors: number; tokens: number }>;
+  topUsers: UserStat[];
+  recentUsers: UserStat[];
+  cacheLastClearedAt: number;
+  startedAt: number;
+  activeKeyId: string | null;
+  keyCount: number;
+}
+
+export function getOverview(): OverviewStats {
+  const usersList = Object.values(data.users);
+  const today = getOrCreateDaily(todayKey());
+  // Always ensure last 14 days exist
+  const daily: OverviewStats["daily"] = [];
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - i);
+    const key = todayKey(d);
+    const raw = data.daily.find((x) => x.date === key);
+    daily.push({
+      date: key,
+      messages: raw?.messages ?? 0,
+      users: raw ? new Set(raw.users).size : 0,
+      errors: raw?.errors ?? 0,
+      tokens: raw?.tokens ?? 0,
+    });
+  }
+  return {
+    totals: {
+      ...data.totals,
+      users: usersList.length,
+    },
+    today: {
+      messages: today.messages,
+      users: today.users.size,
+      errors: today.errors,
+    },
+    daily,
+    topUsers: [...usersList]
+      .sort((a, b) => b.totalMessages - a.totalMessages)
+      .slice(0, 10),
+    recentUsers: [...usersList]
+      .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+      .slice(0, 10),
+    cacheLastClearedAt: data.cacheLastClearedAt,
+    startedAt: data.startedAt,
+    activeKeyId: data.activeKeyId,
+    keyCount: data.apiKeys.length,
+  };
+}
+
+export function searchUsers(query: string, limit = 50): UserStat[] {
+  const q = query.trim().toLowerCase();
+  const all = Object.values(data.users);
+  const filtered = q
+    ? all.filter(
+        (u) =>
+          u.email.toLowerCase().includes(q) ||
+          u.displayName.toLowerCase().includes(q) ||
+          u.uid.toLowerCase().includes(q),
+      )
+    : all;
+  return filtered
+    .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+    .slice(0, limit);
+}
+
+// ===== Cache management =====
+
+let cacheClearTimer: NodeJS.Timeout | null = null;
+
+export function clearGeminiCache(): { clearedAt: number } {
+  data.cacheLastClearedAt = Date.now();
+  data.totals.cacheClears += 1;
+  // The Gemini SDK doesn't expose a runtime cache here, but we reset short-term
+  // counters and bookkeeping that fill up between sessions. This also acts as
+  // a signal for the chat handler to recreate the SDK client on next call.
+  cacheClearSignal++;
+  schedulePersist();
+  return { clearedAt: data.cacheLastClearedAt };
+}
+
+let cacheClearSignal = 0;
+export function getCacheSignal(): number {
+  return cacheClearSignal;
+}
+
+export function startAutoCacheClear(intervalMs = 60 * 60 * 1000) {
+  if (cacheClearTimer) clearInterval(cacheClearTimer);
+  cacheClearTimer = setInterval(() => {
+    clearGeminiCache();
+  }, intervalMs);
+}
+
+// Auto-start
+startAutoCacheClear();
+
+// Force a save on shutdown
+process.on("beforeExit", () => persist());

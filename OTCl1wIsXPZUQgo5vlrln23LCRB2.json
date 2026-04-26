@@ -1,0 +1,35 @@
+import { Router, type IRouter, type Request } from "express";
+import { registerUser } from "../lib/admin-store";
+
+const router: IRouter = Router();
+
+function clientIp(req: Request): string | null {
+  const fwd = req.headers["x-forwarded-for"];
+  if (typeof fwd === "string" && fwd.length > 0) {
+    return fwd.split(",")[0]?.trim() ?? null;
+  }
+  return req.ip ?? null;
+}
+
+router.post("/users/sync", (req, res) => {
+  const body = (req.body ?? {}) as {
+    uid?: string;
+    email?: string;
+    displayName?: string;
+    source?: string;
+  };
+  if (!body.uid || typeof body.uid !== "string") {
+    res.status(400).json({ error: "uid talab qilinadi" });
+    return;
+  }
+  const stat = registerUser({
+    uid: body.uid,
+    email: body.email ?? null,
+    displayName: body.displayName ?? null,
+    source: body.source ?? null,
+    ip: clientIp(req),
+  });
+  res.json({ ok: true, user: stat });
+});
+
+export default router;
